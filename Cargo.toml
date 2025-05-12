@@ -1,0 +1,15 @@
+[package]
+name = "one-billion-row-challenge"
+version = "0.1.0"
+edition = "2021"
+default-run = "one-billion-row-challenge"
+
+[profile.release]
+lto = "thin"
+debug = true
+incremental = true
+
+[dependencies]
+colored = "3"
+fxhash  = "0.2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
