@@ -1,316 +1,412 @@
 #![feature(portable_simd)]
 
 use colored::Colorize;
-use fxhash::FxHashMap;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::simd::cmp::SimdPartialEq;
 use std::simd::Simd;
-use std::{env::args, io::Read};
+use std::sync::{mpsc, Arc, Mutex};
 use xxhash_rust::xxh3::xxh3_64;
-
-// ─────────────────────────────────────────────────────────────── Types
 
 type V = i32;
 
 #[derive(Clone, Copy, Debug)]
-#[repr(align(64))]
 struct Record {
     count: u32,
     min: V,
     max: V,
-    sum: V,
+    sum: i64,
 }
 
-impl Record {
-    const fn default() -> Self {
+impl Default for Record {
+    fn default() -> Self {
         Self {
             count: 0,
-            min: i32::MAX,
-            max: i32::MIN,
+            min: V::MAX,
+            max: V::MIN,
             sum: 0,
         }
     }
+}
 
+impl Record {
     #[inline(always)]
     fn add(&mut self, value: V) {
         self.count += 1;
-        self.sum += value;
+        self.sum += i64::from(value);
         self.min = self.min.min(value);
         self.max = self.max.max(value);
     }
 
-    #[inline(always)]
-    fn merge(&mut self, rhs: &Record) {
-        if rhs.count == 0 {
-            return;
-        }
-        self.count += rhs.count;
-        self.sum += rhs.sum;
-        self.min = self.min.min(rhs.min);
-        self.max = self.max.max(rhs.max);
+    fn merge(&mut self, other: &Self) {
+        self.count += other.count;
+        self.sum += other.sum;
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
     }
 
-    #[inline(always)]
     fn avg(&self) -> V {
-        self.sum / self.count as V
+        let count = i64::from(self.count);
+        let quotient = self.sum.div_euclid(count);
+        let remainder = self.sum.rem_euclid(count);
+        // Round in tenths, with ties toward positive infinity, including negatives.
+        (quotient + i64::from(2 * remainder >= count)) as V
     }
 }
 
+fn format_val(value: V) -> String {
+    format!("{:.1}", f64::from(value) / 10.0)
+}
+
+/// Parse a measurement with one fractional digit into tenths.
 #[inline(always)]
-fn probe(keys: &[u64], mask: usize, key: u64) -> usize {
-    let mut idx = key as usize & mask;
-    loop {
-        let k = unsafe { *keys.get_unchecked(idx) };
-        if k == key {
-            return idx;
-        }
-        idx = (idx + 1) & mask;
+fn parse(mut value: &[u8]) -> V {
+    if value.ends_with(b"\r") {
+        value = &value[..value.len() - 1];
     }
-}
-
-fn scan_chunk(chunk: &[u8], keys: &[u64], mask: usize, num_slots: usize) -> Vec<Record> {
-    let mut slots = vec![Record::default(); num_slots];
-    let mut key_cache: FxHashMap<&[u8], u64> = FxHashMap::default();
-
-    iter_lines(chunk, |name, value| {
-        let key = *key_cache.entry(name).or_insert_with(|| to_key(name));
-        let idx = probe(keys, mask, key);
-        unsafe { slots.get_unchecked_mut(idx) }.add(parse(value));
-    });
-
-    slots
+    let negative = value.starts_with(b"-");
+    if negative {
+        value = &value[1..];
+    }
+    let result = match value {
+        [a @ b'0'..=b'9', b'.', b @ b'0'..=b'9'] => V::from(a - b'0') * 10 + V::from(b - b'0'),
+        [a @ b'0'..=b'9', b @ b'0'..=b'9', b'.', c @ b'0'..=b'9'] => {
+            V::from(a - b'0') * 100 + V::from(b - b'0') * 10 + V::from(c - b'0')
+        }
+        _ => {
+            let (whole, fraction) =
+                value.split_at(value.len().checked_sub(2).expect("empty measurement"));
+            assert!(
+                matches!(fraction, [b'.', b'0'..=b'9']) && !whole.is_empty(),
+                "invalid measurement"
+            );
+            let mut result = 0;
+            for &digit in whole {
+                assert!(digit.is_ascii_digit(), "invalid measurement");
+                result = result * 10 + V::from(digit - b'0');
+            }
+            result * 10 + V::from(fraction[1] - b'0')
+        }
+    };
+    if negative {
+        -result
+    } else {
+        result
+    }
 }
 
 const L: usize = 32;
-#[allow(clippy::upper_case_acronyms)]
 type S = Simd<u8, L>;
 
-#[inline(always)]
-fn to_key(name: &[u8]) -> u64 {
-    xxh3_64(name)
-}
-// ───────────────────────────────────────────── Custom open‑addressing table
+/// Scan bounded, unaligned SIMD blocks, then every remaining byte.
+fn iter_lines<'a>(data: &'a [u8], mut callback: impl FnMut(&'a [u8], &'a [u8])) {
+    let mut start = 0;
+    let mut separator = None;
+    let mut delimiter = |position: usize, byte: u8| match byte {
+        b';' => {
+            assert!(separator.is_none(), "multiple separators in a record");
+            separator = Some(position);
+        }
+        b'\n' => {
+            let sep = separator.take().expect("record missing separator");
+            callback(&data[start..sep], &data[sep + 1..position]);
+            start = position + 1;
+        }
+        _ => {}
+    };
 
+    let mut blocks = data.chunks_exact(L);
+    for (index, block) in blocks.by_ref().enumerate() {
+        let bytes = S::from_slice(block);
+        let mut matches =
+            (bytes.simd_eq(S::splat(b';')) | bytes.simd_eq(S::splat(b'\n'))).to_bitmask();
+        while matches != 0 {
+            let offset = matches.trailing_zeros() as usize;
+            delimiter(index * L + offset, block[offset]);
+            matches &= matches - 1;
+        }
+    }
+    let remainder = blocks.remainder();
+    let base = data.len() - remainder.len();
+    for (offset, &byte) in remainder.iter().enumerate() {
+        delimiter(base + offset, byte);
+    }
+    // Accept a final record without a newline too.
+    if start < data.len() {
+        let sep = separator.expect("record missing separator");
+        callback(&data[start..sep], &data[sep + 1..]);
+    }
+}
+
+struct Station {
+    key: u64,
+    name: Box<[u8]>,
+    record: Record,
+}
+
+// Bucket indices remain valid when the dense station vector reallocates.
+// Empty buckets are represented independently of hashes, so every u64 key is valid.
 struct HashTable {
-    keys: Vec<u64>, // u64::MAX  ==  empty slot
-    records: Vec<Record>,
-    mask: usize,
+    buckets: Vec<usize>,
+    stations: Vec<Station>,
 }
 
 impl HashTable {
-    fn with_capacity(cap: usize) -> Self {
-        let cap = cap.next_power_of_two().max(1);
+    fn new() -> Self {
         Self {
-            keys: vec![u64::MAX; cap],
-            records: vec![Record::default(); cap],
-            mask: cap - 1,
+            buckets: vec![usize::MAX; 1024],
+            stations: Vec::new(),
         }
     }
 
-    #[inline(always)]
-    fn index(&self, key: &u64) -> usize {
-        let mut idx = *key as usize & self.mask;
-        loop {
-            let k = unsafe { *self.keys.get_unchecked(idx) };
-            if k == *key || k == u64::MAX {
-                return idx;
+    fn grow(&mut self) {
+        self.buckets = vec![usize::MAX; self.buckets.len() * 2];
+        let mask = self.buckets.len() - 1;
+        for (index, station) in self.stations.iter().enumerate() {
+            let mut bucket = station.key as usize & mask;
+            while self.buckets[bucket] != usize::MAX {
+                bucket = (bucket + 1) & mask;
             }
-            idx = (idx + 1) & self.mask;
+            self.buckets[bucket] = index;
         }
     }
 
-    /// Insert `key` if it is not present yet.
     #[inline(always)]
-    fn insert_key(&mut self, key: u64) {
-        let idx = self.index(&key);
-        if self.keys[idx] == u64::MAX {
-            self.keys[idx] = key;
-            // record bucket is already zero‑initialised
+    fn record_mut(&mut self, key: u64, name: &[u8]) -> &mut Record {
+        if self.stations.len() * 4 >= self.buckets.len() * 3 {
+            self.grow();
+        }
+        let mask = self.buckets.len() - 1;
+        let mut bucket = key as usize & mask;
+        loop {
+            let index = self.buckets[bucket];
+            if index == usize::MAX {
+                let index = self.stations.len();
+                self.stations.push(Station {
+                    key,
+                    name: name.into(),
+                    record: Record::default(),
+                });
+                self.buckets[bucket] = index;
+                return &mut self.stations[index].record;
+            }
+            let station = &self.stations[index];
+            // Compare the full name even when two stations share a hash.
+            if station.key == key && station.name.as_ref() == name {
+                return &mut self.stations[index].record;
+            }
+            bucket = (bucket + 1) & mask;
         }
     }
 
-    /// Obtain a mutable reference to the `Record` bucket for `key`, creating
-    /// it on‑demand.
-    #[inline(always)]
-    fn record_mut(&mut self, key: u64) -> &mut Record {
-        let idx = self.index(&key);
-        if self.keys[idx] == u64::MAX {
-            self.keys[idx] = key;
-        }
-        unsafe { self.records.get_unchecked_mut(idx) }
+    fn len(&self) -> usize {
+        self.stations.len()
     }
 }
 
-// ─────────────────────────────────────────────── Parser helpers
-
-#[inline]
-fn to_str(name: &[u8]) -> &str {
-    std::str::from_utf8(name).unwrap()
+fn aggregate(data: &[u8]) -> HashTable {
+    let mut stations = HashTable::new();
+    aggregate_into(data, &mut stations);
+    stations
 }
 
-#[inline]
-fn format_val(v: V) -> String {
-    format!("{:.1}", v as f64 / 10.0)
-}
-
-/// Parse the fixed‑point value `±abc.d` into *tenths*.
-fn parse(mut s: &[u8]) -> V {
-    if s.ends_with(b"\r") {
-        // ← new
-        s = &s[..s.len() - 1];
-    }
-    let neg = unsafe {
-        if *s.get_unchecked(0) == b'-' {
-            s = s.get_unchecked(1..);
-            true
-        } else {
-            false
-        }
-    };
-
-    let (a, b, c, d) = match s {
-        [c, b'.', d] => (0, 0, c - b'0', d - b'0'),
-        [b, c, b'.', d] => (0, b - b'0', c - b'0', d - b'0'),
-        [a, b, c, b'.', d] => (a - b'0', b - b'0', c - b'0', d - b'0'),
-        [c] => (0, 0, 0, c - b'0'),
-        [b, c] => (0, b - b'0', c - b'0', 0),
-        [a, b, c] => (a - b'0', b - b'0', c - b'0', 0),
-        _ => panic!("Unknown pattern {:?}", to_str(s)),
-    };
-
-    let v = a as V * 1000 + b as V * 100 + c as V * 10 + d as V;
-    if neg {
-        -v
-    } else {
-        v
-    }
-}
-
-// ───────────────────────────────────────────── SIMD line scanner
-
-#[inline(always)]
-fn iter_lines<'a>(data: &'a [u8], mut callback: impl FnMut(&'a [u8], &'a [u8])) {
-    let simd_data: &[S] = unsafe { data.align_to::<S>().1 };
-
-    let sep = S::splat(b';');
-    let end = S::splat(b'\n');
-    let mut start_pos = 0;
-
-    let eq_step = |i: &mut usize| {
-        *i += 2;
-        let lo = simd_data[*i];
-        let hi = simd_data[*i + 1];
-        (
-            ((sep.simd_eq(hi).to_bitmask() as u64) << 32) | sep.simd_eq(lo).to_bitmask() as u64,
-            ((end.simd_eq(hi).to_bitmask() as u64) << 32) | end.simd_eq(lo).to_bitmask() as u64,
-        )
-    };
-
-    let i = &mut usize::MAX.wrapping_sub(1); // = -2 cast to usize
-    let (mut eq_sep, mut eq_end) = eq_step(i);
-
-    while *i < simd_data.len() - 3 {
-        while eq_sep == 0 {
-            (eq_sep, eq_end) = eq_step(i);
-        }
-        let sep_off = eq_sep.trailing_zeros();
-        eq_sep ^= 1 << sep_off;
-        let sep_pos = L * *i + sep_off as usize;
-
-        while eq_end == 0 {
-            (eq_sep, eq_end) = eq_step(i);
-        }
-        let end_off = eq_end.trailing_zeros();
-        eq_end ^= 1 << end_off;
-        let end_pos = L * *i + end_off as usize;
-
-        unsafe {
-            let name = data.get_unchecked(start_pos..sep_pos);
-            let value = data.get_unchecked(sep_pos + 1..end_pos);
-            callback(name, value);
-        }
-
-        start_pos = end_pos + 1;
-    }
-}
-
-// ────────────────────────────────────────────── Build initial table
-
-fn build_hash_table(data: &[u8]) -> (Vec<(u64, &[u8])>, HashTable) {
-    let mut cities_map = FxHashMap::default();
-    iter_lines(data, |name, _| {
-        let key = to_key(name);
-        let entry = cities_map.entry(key).or_insert(name);
-        debug_assert_eq!(name, *entry);
+fn aggregate_into(data: &[u8], stations: &mut HashTable) {
+    iter_lines(data, |name, value| {
+        stations.record_mut(xxh3_64(name), name).add(parse(value));
     });
-
-    let mut cities = cities_map.into_iter().collect::<Vec<_>>();
-    cities.sort_unstable_by_key(|&(_k, name)| name);
-
-    let mut table = HashTable::with_capacity(cities.len() * 4);
-    for (key, _) in &cities {
-        table.insert_key(*key);
-    }
-
-    (cities, table)
 }
 
-// ────────────────────────────────────────────── entry point
+fn split_chunks(data: &[u8], count: usize) -> Vec<&[u8]> {
+    let count = count.max(1).min(data.len().max(1));
+    let size = data.len().div_ceil(count);
+    let mut chunks = Vec::with_capacity(count);
+    let mut start = 0;
+    for index in 1..count {
+        let target = size * index;
+        if target >= data.len() {
+            break;
+        }
+        let end = data[target..]
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(data.len(), |offset| target + offset + 1);
+        if end > start {
+            chunks.push(&data[start..end]);
+            start = end;
+        }
+    }
+    if start < data.len() {
+        chunks.push(&data[start..]);
+    }
+    chunks
+}
+
+fn aggregate_parallel(data: &[u8], workers: usize) -> HashTable {
+    if workers <= 1 || data.len() < 1024 * 1024 {
+        return aggregate(data);
+    }
+    let chunks = split_chunks(data, workers);
+    std::thread::scope(|scope| {
+        let handles = chunks
+            .into_iter()
+            .map(|chunk| scope.spawn(move || aggregate(chunk)))
+            .collect::<Vec<_>>();
+        let mut result = HashTable::new();
+        for handle in handles {
+            for station in handle.join().expect("worker failed").stations {
+                result
+                    .record_mut(station.key, &station.name)
+                    .merge(&station.record);
+            }
+        }
+        result
+    })
+}
+
+// A read may end in the middle of a record; extend it through the next newline.
+fn read_chunk(reader: &mut impl BufRead, buffer: &mut Vec<u8>, size: usize) -> io::Result<bool> {
+    buffer.clear();
+    reader.take(size as u64).read_to_end(buffer)?;
+    if buffer.is_empty() {
+        return Ok(false);
+    }
+    if !buffer.ends_with(b"\n") {
+        reader.read_until(b'\n', buffer)?;
+    }
+    Ok(true)
+}
+
+fn aggregate_streaming(
+    mut reader: impl BufRead,
+    workers: usize,
+    chunk_size: usize,
+) -> io::Result<HashTable> {
+    if chunk_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "chunk size must be positive",
+        ));
+    }
+    let workers = workers.max(1);
+    let pool_size = workers + 2;
+    let (jobs_tx, jobs_rx) = mpsc::sync_channel::<Vec<u8>>(workers);
+    let (free_tx, free_rx) = mpsc::sync_channel::<Vec<u8>>(pool_size);
+    for _ in 0..pool_size {
+        free_tx
+            .send(Vec::with_capacity(chunk_size.saturating_add(1024)))
+            .expect("buffer pool disconnected");
+    }
+    let jobs_rx = Arc::new(Mutex::new(jobs_rx));
+
+    std::thread::scope(|scope| {
+        let handles = (0..workers)
+            .map(|_| {
+                let jobs_rx = Arc::clone(&jobs_rx);
+                let free_tx = free_tx.clone();
+                scope.spawn(move || {
+                    let mut stations = HashTable::new();
+                    loop {
+                        // Release the queue lock before scanning the buffer.
+                        let job = jobs_rx.lock().expect("work queue poisoned").recv();
+                        let Ok(buffer) = job else {
+                            break;
+                        };
+                        aggregate_into(&buffer, &mut stations);
+                        free_tx.send(buffer).expect("buffer pool disconnected");
+                    }
+                    stations
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(jobs_rx);
+        drop(free_tx);
+
+        let read_result = (|| -> io::Result<()> {
+            loop {
+                let mut buffer = free_rx
+                    .recv()
+                    .map_err(|_| io::Error::other("all workers stopped"))?;
+                if !read_chunk(&mut reader, &mut buffer, chunk_size)? {
+                    break;
+                }
+                jobs_tx
+                    .send(buffer)
+                    .map_err(|_| io::Error::other("all workers stopped"))?;
+            }
+            Ok(())
+        })();
+        drop(jobs_tx);
+
+        let mut result = HashTable::new();
+        for handle in handles {
+            for station in handle.join().expect("worker failed").stations {
+                result
+                    .record_mut(station.key, &station.name)
+                    .merge(&station.record);
+            }
+        }
+        read_result?;
+        Ok(result)
+    })
+}
+/* 
+fn write_results(mut output: impl Write, stations: &HashTable) -> io::Result<()> {
+    let mut sorted = stations.stations.iter().collect::<Vec<_>>();
+    sorted.sort_unstable_by_key(|station| station.name.as_ref());
+    write!(output, "{{")?;
+    for (index, station) in sorted.into_iter().enumerate() {
+        let name = &station.name;
+        let record = station.record;
+        if index != 0 {
+            write!(output, ", ")?;
+        }
+        write!(
+            output,
+            "{}={}/{}/{}",
+            std::str::from_utf8(name).expect("invalid station name"),
+            format_val(record.min),
+            format_val(record.avg()),
+            format_val(record.max)
+        )?;
+    }
+    writeln!(output, "}}")
+}
+*/
 
 fn main() {
     let start = std::time::Instant::now();
-    let filename = args()
-        .nth(1)
+    let read_all = std::env::args().any(|arg| arg == "--read-all");
+    let filename = std::env::args()
+        .skip(1)
+        .find(|arg| arg != "--read-all")
         .unwrap_or_else(|| "measurements.txt".to_string());
-
-    // ── 1. read file & maintain SIMD alignment ───────────────────────────
-    let mut data = Vec::new();
-    let offset;
-    {
-        let stat = std::fs::metadata(&filename).unwrap();
-        data.reserve(stat.len() as usize + 2 * L);
-        data.resize(4 * L, 0);
-        let pre_aligned = unsafe { data.align_to::<S>().0 };
-        offset = pre_aligned.len();
-        data.resize(offset, 0);
-        let mut file = std::fs::File::open(&filename).unwrap();
-        eprint!("read  ");
-        let t0 = std::time::Instant::now();
-        file.read_to_end(&mut data).unwrap();
-        eprintln!("{}", format!("{:>5.1?}", t0.elapsed()).bold().green());
-    }
-    let data = &data[offset..];
-
-    // ── 2. Build hash table  ───────────────
-    let t0 = std::time::Instant::now();
-    let (cities, mut table) = build_hash_table(&data[..100_000]);
-    eprintln!("build {}", format!("{:>5.1?}", t0.elapsed()).bold().green());
-
-    // ── 3. Scan full file & accumulate stats ────────────────────────────
-    iter_lines(data, |name, value| {
-        let key = to_key(name);
-        table.record_mut(key).add(parse(value));
-    });
-
-    // ── 4. Optional per‑city dump (disabled by default) ──────────────────
-    if false {
-        for (key, name) in &cities {
-            let idx = table.index(key);
-            let r = unsafe { *table.records.get_unchecked(idx) };
-            println!(
-                "{}: {}/{}/{}",
-                to_str(name),
-                format_val(r.min),
-                format_val(r.avg()),
-                format_val(r.max)
-            );
-        }
-        let min_len = cities.iter().map(|x| x.1.len()).min().unwrap();
-        let max_len = cities.iter().map(|x| x.1.len()).max().unwrap();
-        eprintln!("Min city len: {min_len}");
-        eprintln!("Max city len: {max_len}");
-    }
-
-    eprintln!("cities {}", cities.len());
+    let workers = std::thread::available_parallelism().map_or(1, usize::from);
+    let stations = if read_all {
+        let data = std::fs::read(filename).expect("failed to read measurements");
+        eprintln!("read: {:.1?}", start.elapsed());
+        let scan_start = std::time::Instant::now();
+        let stations = aggregate_parallel(&data, workers);
+        eprintln!("scan ({workers} threads): {:.1?}", scan_start.elapsed());
+        stations
+    } else {
+        let workers = workers.saturating_sub(1).max(1);
+        let file = std::fs::File::open(filename).expect("failed to open measurements");
+        let stations = aggregate_streaming(BufReader::new(file), workers, 8 * 1024 * 1024)
+            .expect("failed to read measurements");
+        eprintln!("read + scan ({workers} workers): {:.1?}", start.elapsed());
+        stations
+    };
+   let mut output = io::BufWriter::new(io::stdout().lock());
+    //write_results(&mut output, &stations).expect("failed to write statistics");
+    output.flush().expect("failed to flush statistics");
+    eprintln!("cities {}", stations.len());
+    eprintln!(
+        "rows {}",
+        stations
+            .stations
+            .iter()
+            .map(|station| u64::from(station.record.count))
+            .sum::<u64>()
+    );
     eprintln!(
         "total: {}",
         format!("{:>5.1?}", start.elapsed()).bold().green()
